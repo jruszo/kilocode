@@ -490,4 +490,111 @@ describe("GitWatcher", () => {
 			watcher.dispose()
 		})
 	})
+
+	describe("batching", () => {
+		it("should batch files to avoid command line length limits", async () => {
+			// Create a large number of files (more than BATCH_SIZE of 50)
+			const numFiles = 125
+			const addedFiles = Array.from({ length: numFiles }, (_, i) => `file${i}.ts`)
+
+			mockGetGitDiff.mockResolvedValue({
+				added: addedFiles,
+				modified: [],
+				deleted: [],
+			})
+
+			let batchCount = 0
+			mockExecGetLines.mockImplementation(async function* ({ cmd }: { cmd: string }) {
+				batchCount++
+				// Extract file count from command (count quoted filenames)
+				const fileCount = (cmd.match(/"\w+\.ts"/g) || []).length
+				// Each batch should have at most 50 files
+				expect(fileCount).toBeLessThanOrEqual(50)
+
+				// Generate mock output for this batch
+				const matches = cmd.match(/"(file\d+\.ts)"/g) || []
+				for (const match of matches) {
+					const filename = match.replace(/"/g, "")
+					yield `100644 abc${filename.replace(/\D/g, "")} 0 ${filename}`
+				}
+			})
+
+			const watcher = new GitWatcher(config)
+
+			// Call getDiffFiles
+			const files: GitWatcherFile[] = []
+			for await (const file of (watcher as any).getDiffFiles("feature/test", "main")) {
+				files.push(file)
+			}
+
+			// Should have processed all files
+			expect(files).toHaveLength(numFiles)
+
+			// Should have made 3 batches (50 + 50 + 25)
+			expect(batchCount).toBe(3)
+
+			// Verify all files are present
+			for (let i = 0; i < numFiles; i++) {
+				expect(files[i]).toEqual({
+					type: "file",
+					filePath: `file${i}.ts`,
+					fileHash: expect.stringContaining("abc"),
+				})
+			}
+
+			watcher.dispose()
+		})
+
+		it("should handle empty file list without batching", async () => {
+			mockGetGitDiff.mockResolvedValue({
+				added: [],
+				modified: [],
+				deleted: [],
+			})
+
+			const watcher = new GitWatcher(config)
+
+			const files: GitWatcherFile[] = []
+			for await (const file of (watcher as any).getDiffFiles("feature/test", "main")) {
+				files.push(file)
+			}
+
+			expect(files).toHaveLength(0)
+			expect(mockExecGetLines).not.toHaveBeenCalled()
+
+			watcher.dispose()
+		})
+
+		it("should handle single batch when files are under limit", async () => {
+			const addedFiles = Array.from({ length: 25 }, (_, i) => `file${i}.ts`)
+
+			mockGetGitDiff.mockResolvedValue({
+				added: addedFiles,
+				modified: [],
+				deleted: [],
+			})
+
+			let batchCount = 0
+			mockExecGetLines.mockImplementation(async function* ({ cmd }: { cmd: string }) {
+				batchCount++
+				const matches = cmd.match(/"(file\d+\.ts)"/g) || []
+				for (const match of matches) {
+					const filename = match.replace(/"/g, "")
+					yield `100644 abc${filename.replace(/\D/g, "")} 0 ${filename}`
+				}
+			})
+
+			const watcher = new GitWatcher(config)
+
+			const files: GitWatcherFile[] = []
+			for await (const file of (watcher as any).getDiffFiles("feature/test", "main")) {
+				files.push(file)
+			}
+
+			expect(files).toHaveLength(25)
+			expect(batchCount).toBe(1)
+
+			watcher.dispose()
+		})
+	})
 })

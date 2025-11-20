@@ -520,6 +520,7 @@ export class ManagedIndexer implements vscode.Disposable {
 		} finally {
 			// Always clear indexing state when done
 			state.isIndexing = false
+			console.log("[ManagedIndexer] Indexing complete", this)
 		}
 	}
 

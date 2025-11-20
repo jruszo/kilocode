@@ -229,6 +229,8 @@ export class GitWatcher implements vscode.Disposable {
 
 	/**
 	 * Set up file system watchers for git state changes
+	 * Uses fs.watchFile (polling) instead of fs.watch because git replaces files
+	 * during branch switches, which causes fs.watch to stop working
 	 */
 	private async setupGitWatchers(): Promise<void> {
 		try {
@@ -238,24 +240,33 @@ export class GitWatcher implements vscode.Disposable {
 				: path.join(this.config.cwd, gitHeadPath)
 
 			// Watch .git/HEAD for branch switches and commits
-			// We use fs.watch because vscode.workspace.createFileSystemWatcher ignores .git folder
+			// Use fs.watchFile (polling) because git replaces the file during branch switches
+			// which causes fs.watch to stop working after the first event
 			try {
-				const headWatcher = fs.watch(absoluteGitHeadPath, () => {
-					this.handleGitChange()
+				fs.watchFile(absoluteGitHeadPath, { interval: 100 }, (curr, prev) => {
+					// Only trigger if the file actually changed (mtime or size)
+					if (curr.mtime.getTime() !== prev.mtime.getTime() || curr.size !== prev.size) {
+						this.handleGitChange("head")
+					}
 				})
-				this.disposables.push(new vscode.Disposable(() => headWatcher.close()))
+				this.disposables.push(
+					new vscode.Disposable(() => {
+						fs.unwatchFile(absoluteGitHeadPath)
+					}),
+				)
 			} catch (error) {
 				console.warn("[GitWatcher] Could not watch HEAD:", error)
 			}
 
 			// Watch branch refs for commits
+			// Use fs.watch here since refs are modified in place, not replaced
 			try {
 				const gitDir = path.dirname(absoluteGitHeadPath)
 				const refsHeadsPath = path.join(gitDir, "refs", "heads")
 
 				if (fs.existsSync(refsHeadsPath)) {
 					const refsWatcher = fs.watch(refsHeadsPath, { recursive: true }, () => {
-						this.handleGitChange()
+						this.handleGitChange("ref")
 					})
 					this.disposables.push(new vscode.Disposable(() => refsWatcher.close()))
 				}
@@ -264,15 +275,22 @@ export class GitWatcher implements vscode.Disposable {
 			}
 
 			// Watch packed-refs
+			// Use fs.watchFile here too since packed-refs can be replaced
 			try {
 				const gitDir = path.dirname(absoluteGitHeadPath)
 				const packedRefsPath = path.join(gitDir, "packed-refs")
 
 				if (fs.existsSync(packedRefsPath)) {
-					const packedRefsWatcher = fs.watch(packedRefsPath, () => {
-						this.handleGitChange()
+					fs.watchFile(packedRefsPath, { interval: 1000 }, (curr, prev) => {
+						if (curr.mtime.getTime() !== prev.mtime.getTime() || curr.size !== prev.size) {
+							this.handleGitChange("packed-refs")
+						}
 					})
-					this.disposables.push(new vscode.Disposable(() => packedRefsWatcher.close()))
+					this.disposables.push(
+						new vscode.Disposable(() => {
+							fs.unwatchFile(packedRefsPath)
+						}),
+					)
 				}
 			} catch (error) {
 				console.warn("[GitWatcher] Could not watch packed-refs:", error)
@@ -285,14 +303,17 @@ export class GitWatcher implements vscode.Disposable {
 	/**
 	 * Handle git state changes
 	 */
-	private async handleGitChange(): Promise<void> {
+	private async handleGitChange(change?: string): Promise<void> {
+		console.log("[GitWatcher] handleGitChange", change)
+
+		// Prevent concurrent execution - fs.watch can fire multiple times for one git operation
 		if (this.isProcessing) {
 			return
 		}
 
-		try {
-			this.isProcessing = true
+		this.isProcessing = true
 
+		try {
 			// Check for detached HEAD
 			if (await isDetachedHead(this.config.cwd)) {
 				this.currentState = null
@@ -421,11 +442,25 @@ export class GitWatcher implements vscode.Disposable {
 			return
 		}
 
-		// Build single command with all files (quote each to handle spaces)
-		const quotedFiles = filesToScan.map((f) => `"${f}"`).join(" ")
+		// Process files in batches to avoid exceeding shell argument length limits (E2BIG)
+		// On Linux/macOS, the limit is typically ~128KB-2MB depending on system configuration
+		const BATCH_SIZE = 50 // Safe number for command line length
+
+		for (let i = 0; i < filesToScan.length; i += BATCH_SIZE) {
+			const batch = filesToScan.slice(i, i + BATCH_SIZE)
+			yield* this.processBatch(batch)
+		}
+	}
+
+	/**
+	 * Process a batch of files to get their git hashes
+	 */
+	private async *processBatch(files: string[]): AsyncIterable<GitWatcherFile> {
+		// Build command with quoted files to handle spaces
+		const quotedFiles = files.map((f) => `"${f}"`).join(" ")
 		const cmd = `git ls-files -s ${quotedFiles}`
 
-		// Execute once and parse all results
+		// Execute and parse results
 		for await (const line of execGetLines({
 			cmd,
 			cwd: this.config.cwd,
