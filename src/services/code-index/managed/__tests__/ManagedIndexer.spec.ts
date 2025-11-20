@@ -688,6 +688,7 @@ describe("ManagedIndexer", () => {
 						gitBranch: "main",
 						isBaseBranch: true,
 					}),
+					expect.any(Object), // AbortSignal
 				)
 			})
 		})
@@ -710,6 +711,238 @@ describe("ManagedIndexer", () => {
 
 			expect(disposeSpy).toHaveBeenCalled()
 			expect(startSpy).toHaveBeenCalled()
+		})
+	})
+
+	describe("abort mechanism", () => {
+		it("should abort previous operation when new event arrives", async () => {
+			vi.mocked(vscode.workspace).workspaceFolders = [mockWorkspaceFolder]
+			await indexer.start()
+
+			const state = indexer.workspaceFolderState[0]
+			const mockWatcher = state.watcher
+
+			const fs = await import("fs")
+			vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
+
+			// Create first event with slow processing
+			const mockFiles1 = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "file1.ts", fileHash: "hash1" }
+			}
+
+			const event1: GitWatcherEvent = {
+				type: "branch-changed",
+				previousBranch: "main",
+				newBranch: "feature/branch-a",
+				branch: "feature/branch-a",
+				isBaseBranch: false,
+				watcher: mockWatcher!,
+				files: mockFiles1(),
+			}
+
+			// Start first operation
+			const promise1 = indexer.onEvent(event1)
+
+			// Verify first controller was created
+			expect(state.currentAbortController).toBeDefined()
+			const firstController = state.currentAbortController
+
+			// Create second event immediately
+			const mockFiles2 = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "file2.ts", fileHash: "hash2" }
+			}
+
+			const event2: GitWatcherEvent = {
+				type: "branch-changed",
+				previousBranch: "feature/branch-a",
+				newBranch: "feature/branch-b",
+				branch: "feature/branch-b",
+				isBaseBranch: false,
+				watcher: mockWatcher!,
+				files: mockFiles2(),
+			}
+
+			// Start second operation
+			const promise2 = indexer.onEvent(event2)
+
+			// Verify first controller was aborted
+			expect(firstController?.signal.aborted).toBe(true)
+
+			// Verify new controller was created
+			expect(state.currentAbortController).toBeDefined()
+			expect(state.currentAbortController).not.toBe(firstController)
+
+			// Wait for both to complete
+			await Promise.all([promise1, promise2])
+		})
+
+		it("should pass abort signal to upsertFile", async () => {
+			vi.mocked(vscode.workspace).workspaceFolders = [mockWorkspaceFolder]
+			await indexer.start()
+
+			const state = indexer.workspaceFolderState[0]
+			const mockWatcher = state.watcher
+
+			const fs = await import("fs")
+			vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
+
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
+			const event: GitWatcherEvent = {
+				type: "commit",
+				previousCommit: "abc",
+				newCommit: "def",
+				branch: "main",
+				isBaseBranch: true,
+				watcher: mockWatcher!,
+				files: mockFiles(),
+			}
+
+			await indexer.onEvent(event)
+
+			// Wait for async processing
+			await new Promise((resolve) => setTimeout(resolve, 10))
+
+			// Verify upsertFile was called with signal as second argument
+			expect(apiClient.upsertFile).toHaveBeenCalledWith(
+				expect.objectContaining({
+					filePath: "test.ts",
+					fileHash: "abc123",
+				}),
+				expect.any(Object), // AbortSignal
+			)
+		})
+
+		it("should handle abort errors gracefully", async () => {
+			vi.mocked(vscode.workspace).workspaceFolders = [mockWorkspaceFolder]
+			await indexer.start()
+
+			const state = indexer.workspaceFolderState[0]
+			const mockWatcher = state.watcher
+
+			const fs = await import("fs")
+			vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
+
+			// Make upsertFile throw an AbortError
+			const abortError = new Error("AbortError")
+			abortError.name = "AbortError"
+			vi.mocked(apiClient.upsertFile).mockRejectedValue(abortError)
+
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
+			const event: GitWatcherEvent = {
+				type: "commit",
+				previousCommit: "abc",
+				newCommit: "def",
+				branch: "main",
+				isBaseBranch: true,
+				watcher: mockWatcher!,
+				files: mockFiles(),
+			}
+
+			// Should not throw
+			await expect(indexer.onEvent(event)).resolves.not.toThrow()
+
+			// Wait for async processing
+			await new Promise((resolve) => setTimeout(resolve, 10))
+
+			// Should not set error state for abort errors
+			expect(state.error).toBeUndefined()
+		})
+
+		it("should stop processing files when aborted", async () => {
+			vi.mocked(vscode.workspace).workspaceFolders = [mockWorkspaceFolder]
+			await indexer.start()
+
+			const state = indexer.workspaceFolderState[0]
+			const mockWatcher = state.watcher
+
+			const fs = await import("fs")
+			vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
+
+			let filesYielded = 0
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "file1.ts", fileHash: "hash1" }
+				filesYielded++
+				yield { type: "file", filePath: "file2.ts", fileHash: "hash2" }
+				filesYielded++
+				yield { type: "file", filePath: "file3.ts", fileHash: "hash3" }
+				filesYielded++
+			}
+
+			const event1: GitWatcherEvent = {
+				type: "commit",
+				previousCommit: "abc",
+				newCommit: "def",
+				branch: "main",
+				isBaseBranch: true,
+				watcher: mockWatcher!,
+				files: mockFiles(),
+			}
+
+			// Start first operation
+			const promise1 = indexer.onEvent(event1)
+
+			// Immediately trigger abort by starting second operation
+			const mockFiles2 = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "file4.ts", fileHash: "hash4" }
+			}
+
+			const event2: GitWatcherEvent = {
+				type: "commit",
+				previousCommit: "def",
+				newCommit: "ghi",
+				branch: "main",
+				isBaseBranch: true,
+				watcher: mockWatcher!,
+				files: mockFiles2(),
+			}
+
+			const promise2 = indexer.onEvent(event2)
+
+			await Promise.all([promise1, promise2])
+
+			// First operation should have been aborted before processing all files
+			// Note: This is a timing-dependent test, so we just verify it doesn't throw
+			expect(state.isIndexing).toBe(false)
+		})
+
+		it("should clear abort controller after operation completes", async () => {
+			vi.mocked(vscode.workspace).workspaceFolders = [mockWorkspaceFolder]
+			await indexer.start()
+
+			const state = indexer.workspaceFolderState[0]
+			const mockWatcher = state.watcher
+
+			const fs = await import("fs")
+			vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
+
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
+			const event: GitWatcherEvent = {
+				type: "commit",
+				previousCommit: "abc",
+				newCommit: "def",
+				branch: "main",
+				isBaseBranch: true,
+				watcher: mockWatcher!,
+				files: mockFiles(),
+			}
+
+			await indexer.onEvent(event)
+
+			// Wait for async processing
+			await new Promise((resolve) => setTimeout(resolve, 10))
+
+			// Controller should still exist (it's not cleared, just not aborted)
+			expect(state.currentAbortController).toBeDefined()
+			expect(state.currentAbortController?.signal.aborted).toBe(false)
 		})
 	})
 

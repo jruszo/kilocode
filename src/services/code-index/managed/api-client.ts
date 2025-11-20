@@ -16,9 +16,14 @@ import { fetchWithRetries } from "../../../shared/http"
  *
  * @param chunks Array of chunks to upsert (must all be from same org/project/branch)
  * @param kilocodeToken Authentication token
+ * @param signal Optional AbortSignal to cancel the request
  * @throws Error if the request fails or chunks are from different contexts
  */
-export async function upsertChunks(chunks: ManagedCodeChunk[], kilocodeToken: string): Promise<void> {
+export async function upsertChunks(
+	chunks: ManagedCodeChunk[],
+	kilocodeToken: string,
+	signal?: AbortSignal,
+): Promise<void> {
 	if (chunks.length === 0) {
 		return
 	}
@@ -64,6 +69,7 @@ export async function upsertChunks(chunks: ManagedCodeChunk[], kilocodeToken: st
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(requestBody),
+			signal,
 		})
 
 		if (!response.ok) {
@@ -83,10 +89,15 @@ export async function upsertChunks(chunks: ManagedCodeChunk[], kilocodeToken: st
  *
  * @param request Search request with preferences
  * @param kilocodeToken Authentication token
+ * @param signal Optional AbortSignal to cancel the request
  * @returns Array of search results sorted by relevance
  * @throws Error if the request fails
  */
-export async function searchCode(request: SearchRequest, kilocodeToken: string): Promise<SearchResult[]> {
+export async function searchCode(
+	request: SearchRequest,
+	kilocodeToken: string,
+	signal?: AbortSignal,
+): Promise<SearchResult[]> {
 	const baseUrl = getKiloBaseUriFromToken(kilocodeToken)
 
 	try {
@@ -98,6 +109,7 @@ export async function searchCode(request: SearchRequest, kilocodeToken: string):
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(request),
+			signal,
 		})
 
 		if (!response.ok) {
@@ -122,6 +134,7 @@ export async function searchCode(request: SearchRequest, kilocodeToken: string):
  * @param organizationId Organization ID
  * @param projectId Project ID
  * @param kilocodeToken Authentication token
+ * @param signal Optional AbortSignal to cancel the request
  * @throws Error if the request fails
  */
 export async function deleteFiles(
@@ -130,6 +143,7 @@ export async function deleteFiles(
 	organizationId: string,
 	projectId: string,
 	kilocodeToken: string,
+	signal?: AbortSignal,
 ): Promise<void> {
 	if (filePaths.length === 0) {
 		return
@@ -151,6 +165,7 @@ export async function deleteFiles(
 				gitBranch,
 				filePaths,
 			}),
+			signal,
 		})
 
 		if (!response.ok) {
@@ -191,9 +206,10 @@ export interface UpsertFileParams {
  * Upserts a file to the server using multipart file upload
  *
  * @param params Parameters for the file upload
+ * @param signal Optional AbortSignal to cancel the request
  * @throws Error if the request fails
  */
-export async function upsertFile(params: UpsertFileParams): Promise<void> {
+export async function upsertFile(params: UpsertFileParams, signal?: AbortSignal): Promise<void> {
 	const {
 		fileBuffer,
 		organizationId,
@@ -228,6 +244,7 @@ export async function upsertFile(params: UpsertFileParams): Promise<void> {
 				Authorization: `Bearer ${kilocodeToken}`,
 			},
 			body: formData,
+			signal,
 		})
 
 		if (!response.ok) {
@@ -252,6 +269,7 @@ export async function upsertFile(params: UpsertFileParams): Promise<void> {
  * @param projectId Project ID
  * @param gitBranch Git branch name
  * @param kilocodeToken Authentication token
+ * @param signal Optional AbortSignal to cancel the request
  * @returns Server manifest with file metadata
  * @throws Error if the request fails
  */
@@ -260,6 +278,7 @@ export async function getServerManifest(
 	projectId: string,
 	gitBranch: string,
 	kilocodeToken: string,
+	signal?: AbortSignal,
 ): Promise<ServerManifest> {
 	const baseUrl = getKiloBaseUriFromToken(kilocodeToken)
 
@@ -277,6 +296,7 @@ export async function getServerManifest(
 				Authorization: `Bearer ${kilocodeToken}`,
 				"Content-Type": "application/json",
 			},
+			signal,
 		})
 
 		if (!response.ok) {

@@ -3,6 +3,7 @@
 import * as vscode from "vscode"
 import * as path from "path"
 import { promises as fs } from "fs"
+import pMap from "p-map"
 import pLimit from "p-limit"
 import { ContextProxy } from "../../../core/config/ContextProxy"
 import { KiloOrganization } from "../../../shared/kilocode/organization"
@@ -54,6 +55,8 @@ interface ManagedIndexerWorkspaceFolderState {
 	error?: ManagedIndexerError
 	/** In-flight manifest fetch promise - reused if already fetching */
 	manifestFetchPromise: Promise<ServerManifest> | null
+	/** AbortController for the current indexing operation */
+	currentAbortController?: AbortController
 }
 
 export class ManagedIndexer implements vscode.Disposable {
@@ -392,38 +395,62 @@ export class ManagedIndexer implements vscode.Disposable {
 			return
 		}
 
-		// Handle different event types
-		switch (event.type) {
-			case "branch-changed": {
-				console.info(`[ManagedIndexer] Branch changed from ${event.previousBranch} to ${event.newBranch}`)
+		// Cancel any previous indexing operation
+		if (state.currentAbortController) {
+			console.info("[ManagedIndexer] Aborting previous indexing operation")
+			state.currentAbortController.abort()
+		}
 
-				try {
-					// Fetch manifest for the new branch (will reuse if already fetching)
-					await this.getManifest(state, event.newBranch)
-				} catch (error) {
-					// Error already logged and stored in getManifest
-					console.warn(`[ManagedIndexer] Continuing despite manifest fetch error`)
+		// Create new AbortController for this operation
+		const controller = new AbortController()
+		state.currentAbortController = controller
+
+		try {
+			// Handle different event types
+			switch (event.type) {
+				case "branch-changed": {
+					console.info(`[ManagedIndexer] Branch changed from ${event.previousBranch} to ${event.newBranch}`)
+
+					try {
+						// Fetch manifest for the new branch (will reuse if already fetching)
+						await this.getManifest(state, event.newBranch)
+					} catch (error) {
+						// Error already logged and stored in getManifest
+						console.warn(`[ManagedIndexer] Continuing despite manifest fetch error`)
+					}
+
+					// Process files from the async iterable
+					await this.processFiles(state, event, controller.signal)
+					break
 				}
 
-				// Process files from the async iterable
-				await this.processFiles(state, event)
-				break
-			}
+				case "commit": {
+					console.info(`[ManagedIndexer] Commit detected from ${event.previousCommit} to ${event.newCommit}`)
 
-			case "commit": {
-				console.info(`[ManagedIndexer] Commit detected from ${event.previousCommit} to ${event.newCommit}`)
-
-				// Process files from the async iterable
-				await this.processFiles(state, event)
-				break
+					// Process files from the async iterable
+					await this.processFiles(state, event, controller.signal)
+					break
+				}
 			}
+		} catch (error) {
+			// Check if this was an abort
+			if (error instanceof Error && (error.name === "AbortError" || error.message === "AbortError")) {
+				console.info("[ManagedIndexer] Indexing operation was aborted")
+				return
+			}
+			// Re-throw other errors
+			throw error
 		}
 	}
 
 	/**
 	 * Process files from an event's async iterable
 	 */
-	private async processFiles(state: ManagedIndexerWorkspaceFolderState, event: GitWatcherEvent): Promise<void> {
+	private async processFiles(
+		state: ManagedIndexerWorkspaceFolderState,
+		event: GitWatcherEvent,
+		signal: AbortSignal,
+	): Promise<void> {
 		// Set indexing state
 		state.isIndexing = true
 		state.error = undefined
@@ -439,84 +466,108 @@ export class ManagedIndexer implements vscode.Disposable {
 				return
 			}
 
-			// Process each file from the async iterable
-			for await (const file of event.files) {
-				if (file.type === "file-deleted") {
-					console.info(`[ManagedIndexer] File deleted: ${file.filePath} on branch ${event.branch}`)
-					// TODO: Implement file deletion handling if needed
-					continue
-				}
+			await pMap(
+				event.files,
+				async (file) => {
+					// Check if operation was aborted
+					if (signal.aborted) {
+						throw new Error("AbortError")
+					}
 
-				const { filePath, fileHash } = file
+					if (file.type === "file-deleted") {
+						console.info(`[ManagedIndexer] File deleted: ${file.filePath} on branch ${event.branch}`)
+						// TODO: Implement file deletion handling if needed
+						return
+					}
 
-				// Check if file extension is supported
-				const ext = path.extname(filePath).toLowerCase()
-				if (!scannerExtensions.includes(ext)) {
-					continue
-				}
+					const { filePath, fileHash } = file
 
-				// Already indexed - check if fileHash exists in the map and matches the filePath
-				if (manifest.files[fileHash] === filePath) {
-					continue
-				}
+					// Check if file extension is supported
+					const ext = path.extname(filePath).toLowerCase()
+					if (!scannerExtensions.includes(ext)) {
+						return
+					}
 
-				// Concurrently process the file
-				await this.fileUpsertLimit(async () => {
-					try {
-						// Ensure we have the necessary configuration
-						if (!this.config?.kilocodeToken || !this.config?.kilocodeOrganizationId || !state.projectId) {
-							console.warn(
-								"[ManagedIndexer] Missing token, organization ID, or project ID, skipping file upsert",
+					// Already indexed - check if fileHash exists in the map and matches the filePath
+					if (manifest.files[fileHash] === filePath) {
+						return
+					}
+
+					{
+						// Check if operation was aborted before processing
+						if (signal.aborted) {
+							throw new Error("AbortError")
+						}
+
+						try {
+							// Ensure we have the necessary configuration
+							if (
+								!this.config?.kilocodeToken ||
+								!this.config?.kilocodeOrganizationId ||
+								!state.projectId
+							) {
+								console.warn(
+									"[ManagedIndexer] Missing token, organization ID, or project ID, skipping file upsert",
+								)
+								return
+							}
+							const projectId = state.projectId
+
+							const absoluteFilePath = path.isAbsolute(filePath)
+								? filePath
+								: path.join(event.watcher.config.cwd, filePath)
+							const fileBuffer = await fs.readFile(absoluteFilePath)
+							const relativeFilePath = path.relative(event.watcher.config.cwd, absoluteFilePath)
+
+							// Call the upsertFile API with abort signal
+							await upsertFile(
+								{
+									fileBuffer,
+									fileHash,
+									filePath: relativeFilePath,
+									gitBranch: event.branch,
+									isBaseBranch: event.isBaseBranch,
+									organizationId: this.config.kilocodeOrganizationId,
+									projectId,
+									kilocodeToken: this.config.kilocodeToken,
+								},
+								signal,
 							)
-							return
-						}
-						const projectId = state.projectId
 
-						const absoluteFilePath = path.isAbsolute(filePath)
-							? filePath
-							: path.join(event.watcher.config.cwd, filePath)
-						const fileBuffer = await fs.readFile(absoluteFilePath)
-						const relativeFilePath = path.relative(event.watcher.config.cwd, absoluteFilePath)
+							console.info(
+								`[ManagedIndexer] Successfully upserted file: ${relativeFilePath} (branch: ${event.branch})`,
+							)
 
-						// Call the upsertFile API
-						await upsertFile({
-							fileBuffer,
-							fileHash,
-							filePath: relativeFilePath,
-							gitBranch: event.branch,
-							isBaseBranch: event.isBaseBranch,
-							organizationId: this.config.kilocodeOrganizationId,
-							projectId,
-							kilocodeToken: this.config.kilocodeToken,
-						})
+							// Clear any previous file-upsert errors on success
+							if (state.error?.type === "file-upsert") {
+								state.error = undefined
+							}
+						} catch (error) {
+							// Don't log abort errors as failures
+							if (error instanceof Error && error.message === "AbortError") {
+								throw error
+							}
 
-						console.info(
-							`[ManagedIndexer] Successfully upserted file: ${relativeFilePath} (branch: ${event.branch})`,
-						)
+							const errorMessage = error instanceof Error ? error.message : String(error)
+							console.error(`[ManagedIndexer] Failed to upsert file ${filePath}: ${errorMessage}`)
 
-						// Clear any previous file-upsert errors on success
-						if (state.error?.type === "file-upsert") {
-							state.error = undefined
-						}
-					} catch (error) {
-						const errorMessage = error instanceof Error ? error.message : String(error)
-						console.error(`[ManagedIndexer] Failed to upsert file ${filePath}: ${errorMessage}`)
-
-						// Store the error in state
-						state.error = {
-							type: "file-upsert",
-							message: `Failed to upsert file: ${errorMessage}`,
-							timestamp: new Date().toISOString(),
-							context: {
-								filePath,
-								branch: event.branch,
-								operation: "file-upsert",
-							},
-							details: error instanceof Error ? error.stack : undefined,
+							// Store the error in state
+							state.error = {
+								type: "file-upsert",
+								message: `Failed to upsert file: ${errorMessage}`,
+								timestamp: new Date().toISOString(),
+								context: {
+									filePath,
+									branch: event.branch,
+									operation: "file-upsert",
+								},
+								details: error instanceof Error ? error.stack : undefined,
+							}
 						}
 					}
-				})
-			}
+				},
+				{ concurrency: 20 },
+			)
 		} finally {
 			// Always clear indexing state when done
 			state.isIndexing = false

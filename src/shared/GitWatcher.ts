@@ -222,6 +222,9 @@ export class GitWatcher implements vscode.Disposable {
 
 			// Set up file system watchers for git state changes
 			await this.setupGitWatchers()
+
+			// Kick off initial scan
+			this.handleGitChange()
 		} catch (error) {
 			console.error("[GitWatcher] Failed to initialize watcher:", error)
 		}

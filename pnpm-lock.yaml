@@ -1816,6 +1816,9 @@ importers:
       p-limit:
         specifier: ^6.2.0
         version: 6.2.0
+      p-map:
+        specifier: ^7.0.3
+        version: 7.0.3
       p-retry:
         specifier: ^7.1.0
         version: 7.1.0
