@@ -330,6 +330,9 @@ export class GitWatcher implements vscode.Disposable {
 			])
 			const newState: GitStateSnapshot = { branch, commit, isDetached: false }
 
+			const defaultBranch = await this.getDefaultBranch()
+			const isBaseBranch = newState.branch.toLowerCase() === defaultBranch.toLowerCase()
+
 			// Check if state actually changed
 			if (this.currentState) {
 				const branchChanged = this.currentState.branch !== newState.branch
@@ -338,9 +341,6 @@ export class GitWatcher implements vscode.Disposable {
 				if (!branchChanged && !commitChanged) {
 					return
 				}
-
-				const defaultBranch = await this.getDefaultBranch()
-				const isBaseBranch = newState.branch.toLowerCase() === defaultBranch.toLowerCase()
 
 				// Emit branch-changed event if branch changed
 				if (branchChanged) {
@@ -365,6 +365,17 @@ export class GitWatcher implements vscode.Disposable {
 						files: this.getFiles(newState.branch, isBaseBranch),
 					})
 				}
+			} else {
+				// First run - emit initial commit event to trigger scan
+				this.emitEvent({
+					type: "commit",
+					previousCommit: "",
+					newCommit: newState.commit,
+					branch: newState.branch,
+					isBaseBranch,
+					watcher: this,
+					files: this.getFiles(newState.branch, isBaseBranch),
+				})
 			}
 
 			this.currentState = newState
