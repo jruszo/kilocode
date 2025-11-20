@@ -1,8 +1,6 @@
 # kilo-code
 
-## 4.121.1
-
-### Patch Changes
+## [v4.121.1]
 
 - [#3915](https://github.com/Kilo-Org/kilocode/pull/3915) [`c096af9`](https://github.com/Kilo-Org/kilocode/commit/c096af99d3eb6d18a7faa1bf7234250802225645) Thanks [@chrarnoldus](https://github.com/chrarnoldus)! - Improve file edit success rates for non-Claude models with native tool calling
 
