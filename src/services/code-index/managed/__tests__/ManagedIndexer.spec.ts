@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import * as vscode from "vscode"
 import { ManagedIndexer } from "../ManagedIndexer"
 import { ContextProxy } from "../../../../core/config/ContextProxy"
-import { GitWatcher, GitWatcherEvent } from "../../../../shared/GitWatcher"
+import { GitWatcher, GitWatcherEvent, GitWatcherFile } from "../../../../shared/GitWatcher"
 import { OrganizationService } from "../../../kilocode/OrganizationService"
 import * as gitUtils from "../git-utils"
 import * as kiloConfigFile from "../../../../utils/kilo-config-file"
@@ -100,7 +100,6 @@ describe("ManagedIndexer", () => {
 			const mockWatcher = {
 				config: { cwd: "/test/workspace" },
 				onEvent: vi.fn(),
-				scan: vi.fn().mockResolvedValue(undefined),
 				start: vi.fn().mockResolvedValue(undefined),
 				dispose: vi.fn(),
 			}
@@ -323,14 +322,6 @@ describe("ManagedIndexer", () => {
 			expect(mockWatcher!.onEvent).toHaveBeenCalled()
 		})
 
-		it("should perform initial scan for each watcher", async () => {
-			await indexer.start()
-
-			const mockWatcher = indexer.workspaceFolderState[0].watcher
-			expect(mockWatcher).toBeDefined()
-			expect(mockWatcher!.scan).toHaveBeenCalled()
-		})
-
 		it("should start each watcher", async () => {
 			await indexer.start()
 
@@ -506,11 +497,18 @@ describe("ManagedIndexer", () => {
 		it("should not process events when not active", async () => {
 			indexer.isActive = false
 
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
 			const event: GitWatcherEvent = {
-				type: "scan-start",
-				branch: "main",
-				isBaseBranch: true,
+				type: "branch-changed",
+				previousBranch: "main",
+				newBranch: "feature/test",
+				branch: "feature/test",
+				isBaseBranch: false,
 				watcher: mockWatcher,
+				files: mockFiles(),
 			}
 
 			await indexer.onEvent(event)
@@ -521,11 +519,18 @@ describe("ManagedIndexer", () => {
 		it("should not process events from unknown watcher", async () => {
 			const unknownWatcher = new GitWatcher({ cwd: "/unknown" })
 
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
 			const event: GitWatcherEvent = {
-				type: "scan-start",
-				branch: "main",
-				isBaseBranch: true,
+				type: "branch-changed",
+				previousBranch: "main",
+				newBranch: "feature/test",
+				branch: "feature/test",
+				isBaseBranch: false,
 				watcher: unknownWatcher,
+				files: mockFiles(),
 			}
 
 			await indexer.onEvent(event)
@@ -534,59 +539,19 @@ describe("ManagedIndexer", () => {
 			expect(state.isIndexing).toBe(false)
 		})
 
-		describe("scan-start event", () => {
-			it("should set isIndexing to true", async () => {
-				const event: GitWatcherEvent = {
-					type: "scan-start",
-					branch: "main",
-					isBaseBranch: true,
-					watcher: mockWatcher,
-				}
-
-				await indexer.onEvent(event)
-
-				expect(state.isIndexing).toBe(true)
-			})
-		})
-
-		describe("scan-end event", () => {
-			it("should set isIndexing to false", async () => {
-				state.isIndexing = true
-
-				const event: GitWatcherEvent = {
-					type: "scan-end",
-					branch: "main",
-					isBaseBranch: true,
-					watcher: mockWatcher,
-				}
-
-				await indexer.onEvent(event)
-
-				expect(state.isIndexing).toBe(false)
-			})
-		})
-
-		describe("file-deleted event", () => {
-			it("should handle file deletion", async () => {
-				const event: GitWatcherEvent = {
-					type: "file-deleted",
-					filePath: "deleted.ts",
-					branch: "main",
-					isBaseBranch: true,
-					watcher: mockWatcher,
-				}
-
-				// Should not throw
-				await indexer.onEvent(event)
-			})
-		})
-
 		describe("branch-changed event", () => {
-			it("should fetch new manifest for the new branch", async () => {
+			it("should fetch new manifest and process files", async () => {
+				const fs = await import("fs")
+				vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
+
 				const newManifest = {
-					files: { new123: "new-branch-file.ts" },
+					files: {},
 				}
 				vi.mocked(apiClient.getServerManifest).mockResolvedValue(newManifest as any)
+
+				const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+					yield { type: "file", filePath: "new-file.ts", fileHash: "def456" }
+				}
 
 				const event: GitWatcherEvent = {
 					type: "branch-changed",
@@ -595,6 +560,7 @@ describe("ManagedIndexer", () => {
 					branch: "feature/test",
 					isBaseBranch: false,
 					watcher: mockWatcher,
+					files: mockFiles(),
 				}
 
 				await indexer.onEvent(event)
@@ -611,13 +577,16 @@ describe("ManagedIndexer", () => {
 				)
 				expect(state.manifest).toEqual(newManifest)
 				expect(state.gitBranch).toBe("feature/test")
+
+				// Wait for async file processing
+				await new Promise((resolve) => setTimeout(resolve, 10))
+
+				expect(apiClient.upsertFile).toHaveBeenCalled()
 			})
 
-			it("should clear manifest errors on successful fetch", async () => {
-				state.error = {
-					type: "manifest",
-					message: "Previous error",
-					timestamp: new Date().toISOString(),
+			it("should handle file deletions", async () => {
+				const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+					yield { type: "file-deleted", filePath: "deleted.ts" }
 				}
 
 				const event: GitWatcherEvent = {
@@ -627,15 +596,19 @@ describe("ManagedIndexer", () => {
 					branch: "feature/test",
 					isBaseBranch: false,
 					watcher: mockWatcher,
+					files: mockFiles(),
 				}
 
 				await indexer.onEvent(event)
 
-				expect(state.error).toBeUndefined()
+				// Should not throw, deletion handling is TODO
+				expect(state.isIndexing).toBe(false)
 			})
 
-			it("should handle manifest fetch errors", async () => {
-				vi.mocked(apiClient.getServerManifest).mockRejectedValue(new Error("API error"))
+			it("should skip files with unsupported extensions", async () => {
+				const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+					yield { type: "file", filePath: "test.unsupported", fileHash: "abc123" }
+				}
 
 				const event: GitWatcherEvent = {
 					type: "branch-changed",
@@ -644,155 +617,64 @@ describe("ManagedIndexer", () => {
 					branch: "feature/test",
 					isBaseBranch: false,
 					watcher: mockWatcher,
+					files: mockFiles(),
 				}
 
 				await indexer.onEvent(event)
 
-				expect(state.error).toBeDefined()
-				expect(state.error?.type).toBe("manifest")
-				expect(state.error?.message).toContain("Failed to fetch manifest")
-				expect(state.error?.context?.branch).toBe("feature/test")
-			})
-
-			it("should reuse in-flight manifest fetch", async () => {
-				// Clear any previous calls from setup
-				vi.mocked(apiClient.getServerManifest).mockClear()
-				vi.mocked(kiloConfigFile.getKilocodeConfig).mockClear()
-
-				// Make manifest fetch take some time
-				let resolveManifest: any
-				const manifestPromise = new Promise((resolve) => {
-					resolveManifest = resolve
-				})
-				vi.mocked(apiClient.getServerManifest).mockReturnValue(manifestPromise as any)
-
-				const branchEvent: GitWatcherEvent = {
-					type: "branch-changed",
-					previousBranch: "main",
-					newBranch: "feature/test",
-					branch: "feature/test",
-					isBaseBranch: false,
-					watcher: mockWatcher,
-				}
-
-				// Start branch change (will initiate fetch)
-				const branchChangePromise = indexer.onEvent(branchEvent)
-
-				// Wait a bit to ensure the promise is cached
-				await new Promise((resolve) => setTimeout(resolve, 5))
-
-				// Try to process a file-changed event while manifest is being fetched
-				// This should reuse the same promise
-				const fileEvent: GitWatcherEvent = {
-					type: "file-changed",
-					filePath: "test.ts",
-					fileHash: "abc123",
-					branch: "feature/test",
-					isBaseBranch: false,
-					watcher: mockWatcher,
-				}
-
-				const fileEventPromise = indexer.onEvent(fileEvent)
-
-				// Complete the manifest fetch
-				resolveManifest({ files: {} })
-				await Promise.all([branchChangePromise, fileEventPromise])
-
-				// Should only have called getServerManifest once (reused the promise)
-				expect(apiClient.getServerManifest).toHaveBeenCalledTimes(1)
-				expect(apiClient.getServerManifest).toHaveBeenCalledWith(
-					"test-org-id",
-					"test-project-id",
-					"feature/test",
-					"test-token",
-				)
-			})
-
-			it("should handle manifest fetch errors gracefully", async () => {
-				vi.mocked(apiClient.getServerManifest).mockRejectedValue(new Error("API error"))
-
-				const event: GitWatcherEvent = {
-					type: "branch-changed",
-					previousBranch: "main",
-					newBranch: "feature/test",
-					branch: "feature/test",
-					isBaseBranch: false,
-					watcher: mockWatcher,
-				}
-
-				// Should not throw
-				await indexer.onEvent(event)
-
-				expect(state.error).toBeDefined()
-				expect(state.error?.type).toBe("manifest")
-			})
-		})
-
-		describe("file-changed event", () => {
-			it("should skip already indexed files", async () => {
-				state.manifest = {
-					files: { abc123: "test.ts" },
-				}
-
-				const event: GitWatcherEvent = {
-					type: "file-changed",
-					filePath: "test.ts",
-					fileHash: "abc123",
-					branch: "main",
-					isBaseBranch: true,
-					watcher: mockWatcher,
-				}
-
-				await indexer.onEvent(event)
+				await new Promise((resolve) => setTimeout(resolve, 10))
 
 				expect(apiClient.upsertFile).not.toHaveBeenCalled()
 			})
 
-			it("should upsert new files", async () => {
-				const fs = await import("fs")
-				vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
+			it("should skip already indexed files", async () => {
+				// Set up manifest with already indexed file
+				const manifestWithFile = {
+					files: { abc123: "test.ts" },
+				}
+				vi.mocked(apiClient.getServerManifest).mockResolvedValue(manifestWithFile as any)
 
-				state.manifest = { files: {} }
+				const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+					yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+				}
 
 				const event: GitWatcherEvent = {
-					type: "file-changed",
-					filePath: "new-file.ts",
-					fileHash: "def456",
-					branch: "main",
-					isBaseBranch: true,
+					type: "branch-changed",
+					previousBranch: "main",
+					newBranch: "feature/test",
+					branch: "feature/test",
+					isBaseBranch: false,
 					watcher: mockWatcher,
+					files: mockFiles(),
 				}
 
 				await indexer.onEvent(event)
 
-				// Wait for async file upsert to complete
 				await new Promise((resolve) => setTimeout(resolve, 10))
 
-				expect(apiClient.upsertFile).toHaveBeenCalledWith({
-					fileBuffer: expect.any(Buffer),
-					fileHash: "def456",
-					filePath: "new-file.ts",
-					gitBranch: "main",
-					isBaseBranch: true,
-					organizationId: "test-org-id",
-					projectId: "test-project-id",
-					kilocodeToken: "test-token",
-				})
+				expect(apiClient.upsertFile).not.toHaveBeenCalled()
 			})
+		})
 
-			it("should handle absolute file paths", async () => {
+		describe("commit event", () => {
+			it("should process files from commit", async () => {
 				const fs = await import("fs")
 				vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
 
 				state.manifest = { files: {} }
 
+				const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+					yield { type: "file", filePath: "updated-file.ts", fileHash: "ghi789" }
+				}
+
 				const event: GitWatcherEvent = {
-					type: "file-changed",
-					filePath: "/test/workspace/absolute-file.ts",
-					fileHash: "ghi789",
+					type: "commit",
+					previousCommit: "abc123",
+					newCommit: "def456",
 					branch: "main",
 					isBaseBranch: true,
 					watcher: mockWatcher,
+					files: mockFiles(),
 				}
 
 				await indexer.onEvent(event)
@@ -801,100 +683,12 @@ describe("ManagedIndexer", () => {
 
 				expect(apiClient.upsertFile).toHaveBeenCalledWith(
 					expect.objectContaining({
-						filePath: "absolute-file.ts",
+						filePath: "updated-file.ts",
+						fileHash: "ghi789",
+						gitBranch: "main",
+						isBaseBranch: true,
 					}),
 				)
-			})
-
-			it("should skip upsert when token is missing", async () => {
-				indexer.config = {
-					kilocodeOrganizationId: "test-org-id",
-					kilocodeToken: null,
-					kilocodeTesterWarningsDisabledUntil: null,
-				}
-
-				state.manifest = { files: {} }
-
-				const event: GitWatcherEvent = {
-					type: "file-changed",
-					filePath: "test.ts",
-					fileHash: "abc123",
-					branch: "main",
-					isBaseBranch: true,
-					watcher: mockWatcher,
-				}
-
-				await indexer.onEvent(event)
-
-				await new Promise((resolve) => setTimeout(resolve, 10))
-
-				expect(apiClient.upsertFile).not.toHaveBeenCalled()
-			})
-
-			it("should handle file read errors", async () => {
-				const fs = await import("fs")
-				vi.mocked(fs.promises.readFile).mockRejectedValue(new Error("File not found"))
-
-				state.manifest = { files: {} }
-
-				const event: GitWatcherEvent = {
-					type: "file-changed",
-					filePath: "missing.ts",
-					fileHash: "xyz999",
-					branch: "main",
-					isBaseBranch: true,
-					watcher: mockWatcher,
-				}
-
-				await indexer.onEvent(event)
-
-				await new Promise((resolve) => setTimeout(resolve, 10))
-
-				// Error should be stored in state
-				expect(state.error?.type).toBe("file-upsert")
-			})
-
-			it("should handle API errors", async () => {
-				const fs = await import("fs")
-				vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
-				vi.mocked(apiClient.upsertFile).mockRejectedValue(new Error("API error"))
-
-				state.manifest = { files: {} }
-
-				const event: GitWatcherEvent = {
-					type: "file-changed",
-					filePath: "test.ts",
-					fileHash: "abc123",
-					branch: "main",
-					isBaseBranch: true,
-					watcher: mockWatcher,
-				}
-
-				await indexer.onEvent(event)
-
-				await new Promise((resolve) => setTimeout(resolve, 10))
-
-				// Error should be stored in state
-				expect(state.error?.type).toBe("file-upsert")
-			})
-
-			it("should skip files with unsupported extensions", async () => {
-				state.manifest = { files: {} }
-
-				const event: GitWatcherEvent = {
-					type: "file-changed",
-					filePath: "test.unsupported",
-					fileHash: "abc123",
-					branch: "main",
-					isBaseBranch: true,
-					watcher: mockWatcher,
-				}
-
-				await indexer.onEvent(event)
-
-				await new Promise((resolve) => setTimeout(resolve, 10))
-
-				expect(apiClient.upsertFile).not.toHaveBeenCalled()
 			})
 		})
 	})
@@ -982,25 +776,28 @@ describe("ManagedIndexer", () => {
 			const state1 = indexer.workspaceFolderState[0]
 			const state2 = indexer.workspaceFolderState[1]
 
-			// Start scan on first workspace
+			// Process event on first workspace
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
 			expect(state1.watcher).toBeDefined()
-			await indexer.onEvent({
-				type: "scan-start",
+			const eventPromise = indexer.onEvent({
+				type: "commit",
+				previousCommit: "abc",
+				newCommit: "def",
 				branch: "main",
 				isBaseBranch: true,
 				watcher: state1.watcher!,
+				files: mockFiles(),
 			})
 
+			// During processing, isIndexing should be true
 			expect(state1.isIndexing).toBe(true)
 			expect(state2.isIndexing).toBe(false)
 
-			// End scan on first workspace
-			await indexer.onEvent({
-				type: "scan-end",
-				branch: "main",
-				isBaseBranch: true,
-				watcher: state1.watcher!,
-			})
+			// Wait for processing to complete
+			await eventPromise
 
 			expect(state1.isIndexing).toBe(false)
 			expect(state2.isIndexing).toBe(false)

@@ -58,6 +58,16 @@ export interface GitDiff {
 }
 
 /**
+ * A single file change from git diff
+ */
+export interface GitDiffFile {
+	/** Type of change */
+	type: "added" | "modified" | "deleted"
+	/** File path relative to workspace root */
+	filePath: string
+}
+
+/**
  * Configuration for managed indexing
  */
 export interface ManagedIndexingConfig {

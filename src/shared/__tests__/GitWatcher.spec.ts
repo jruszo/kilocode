@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { EventEmitter } from "events"
 import * as vscode from "vscode"
 import * as fs from "fs"
-import { GitWatcher, GitWatcherConfig, GitWatcherEvent, GitWatcherFileChangedEvent } from "../GitWatcher"
+import { GitWatcher, GitWatcherConfig, GitWatcherEvent, GitWatcherFile } from "../GitWatcher"
 import * as exec from "../utils/exec"
 import * as gitUtils from "../../services/code-index/managed/git-utils"
 
@@ -104,20 +104,25 @@ describe("GitWatcher", () => {
 	})
 
 	describe("onEvent", () => {
-		it("should register an event handler", () => {
+		it("should register an event handler", async () => {
 			const watcher = new GitWatcher(config)
 			const handler = vi.fn()
 
 			watcher.onEvent(handler)
 
-			// Verify handler is registered by emitting an event
-			const testEvent: GitWatcherFileChangedEvent = {
-				type: "file-changed",
-				filePath: "test.ts",
-				fileHash: "abc123",
-				branch: "main",
-				isBaseBranch: true,
+			// Create a mock async iterable
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
+			const testEvent: GitWatcherEvent = {
+				type: "branch-changed",
+				previousBranch: "main",
+				newBranch: "feature/test",
+				branch: "feature/test",
+				isBaseBranch: false,
 				watcher,
+				files: mockFiles(),
 			}
 
 			// Access the private emitter to test
@@ -127,7 +132,7 @@ describe("GitWatcher", () => {
 			watcher.dispose()
 		})
 
-		it("should allow multiple handlers", () => {
+		it("should allow multiple handlers", async () => {
 			const watcher = new GitWatcher(config)
 			const handler1 = vi.fn()
 			const handler2 = vi.fn()
@@ -135,13 +140,18 @@ describe("GitWatcher", () => {
 			watcher.onEvent(handler1)
 			watcher.onEvent(handler2)
 
-			const testEvent: GitWatcherFileChangedEvent = {
-				type: "file-changed",
-				filePath: "test.ts",
-				fileHash: "abc123",
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
+			const testEvent: GitWatcherEvent = {
+				type: "commit",
+				previousCommit: "abc123",
+				newCommit: "def456",
 				branch: "main",
 				isBaseBranch: true,
 				watcher,
+				files: mockFiles(),
 			}
 
 			;(watcher as any).emitter.emit("event", testEvent)
@@ -151,59 +161,15 @@ describe("GitWatcher", () => {
 			watcher.dispose()
 		})
 
-		it("should emit scan-start and scan-end events", () => {
+		it("should emit branch-changed events with files iterable", async () => {
 			const watcher = new GitWatcher(config)
 			const handler = vi.fn()
 
 			watcher.onEvent(handler)
 
-			const scanStartEvent: GitWatcherEvent = {
-				type: "scan-start",
-				branch: "main",
-				isBaseBranch: true,
-				watcher,
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
 			}
-
-			const scanEndEvent: GitWatcherEvent = {
-				type: "scan-end",
-				branch: "main",
-				isBaseBranch: true,
-				watcher,
-			}
-
-			;(watcher as any).emitter.emit("event", scanStartEvent)
-			;(watcher as any).emitter.emit("event", scanEndEvent)
-
-			expect(handler).toHaveBeenCalledWith(scanStartEvent)
-			expect(handler).toHaveBeenCalledWith(scanEndEvent)
-			watcher.dispose()
-		})
-
-		it("should emit file-deleted events", () => {
-			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-
-			watcher.onEvent(handler)
-
-			const deleteEvent: GitWatcherEvent = {
-				type: "file-deleted",
-				filePath: "deleted.ts",
-				branch: "feature/test",
-				isBaseBranch: false,
-				watcher,
-			}
-
-			;(watcher as any).emitter.emit("event", deleteEvent)
-
-			expect(handler).toHaveBeenCalledWith(deleteEvent)
-			watcher.dispose()
-		})
-
-		it("should emit branch-changed events", () => {
-			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-
-			watcher.onEvent(handler)
 
 			const branchChangedEvent: GitWatcherEvent = {
 				type: "branch-changed",
@@ -212,11 +178,38 @@ describe("GitWatcher", () => {
 				branch: "feature/test",
 				isBaseBranch: false,
 				watcher,
+				files: mockFiles(),
 			}
 
 			;(watcher as any).emitter.emit("event", branchChangedEvent)
 
 			expect(handler).toHaveBeenCalledWith(branchChangedEvent)
+			watcher.dispose()
+		})
+
+		it("should emit commit events with files iterable", async () => {
+			const watcher = new GitWatcher(config)
+			const handler = vi.fn()
+
+			watcher.onEvent(handler)
+
+			const mockFiles = async function* (): AsyncIterable<GitWatcherFile> {
+				yield { type: "file", filePath: "test.ts", fileHash: "abc123" }
+			}
+
+			const commitEvent: GitWatcherEvent = {
+				type: "commit",
+				previousCommit: "abc123",
+				newCommit: "def456",
+				branch: "main",
+				isBaseBranch: true,
+				watcher,
+				files: mockFiles(),
+			}
+
+			;(watcher as any).emitter.emit("event", commitEvent)
+
+			expect(handler).toHaveBeenCalledWith(commitEvent)
 			watcher.dispose()
 		})
 	})
@@ -246,210 +239,6 @@ describe("GitWatcher", () => {
 		})
 	})
 
-	describe("scan", () => {
-		it("should scan all files when on default branch", async () => {
-			mockGetCurrentBranch.mockResolvedValue("main")
-			mockGetBaseBranch.mockResolvedValue("main")
-
-			// Mock git ls-files -s output
-			const mockLines = [
-				"100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0 README.md",
-				"100644 a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0 0 src/index.ts",
-			]
-
-			mockExecGetLines.mockImplementation(async function* () {
-				for (const line of mockLines) {
-					yield line
-				}
-			})
-
-			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-			watcher.onEvent(handler)
-
-			await watcher.scan()
-
-			// Should emit: scan-start, file-changed (x2), scan-end
-			expect(handler).toHaveBeenCalledTimes(4)
-
-			// Check scan-start event
-			expect(handler).toHaveBeenCalledWith(
-				expect.objectContaining({
-					type: "scan-start",
-					branch: "main",
-					isBaseBranch: true,
-				}),
-			)
-
-			// Check file-changed events
-			expect(handler).toHaveBeenCalledWith(
-				expect.objectContaining({
-					type: "file-changed",
-					filePath: "README.md",
-					fileHash: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
-					branch: "main",
-					isBaseBranch: true,
-				}),
-			)
-			expect(handler).toHaveBeenCalledWith(
-				expect.objectContaining({
-					type: "file-changed",
-					filePath: "src/index.ts",
-					fileHash: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0",
-					branch: "main",
-					isBaseBranch: true,
-				}),
-			)
-
-			// Check scan-end event
-			expect(handler).toHaveBeenCalledWith(
-				expect.objectContaining({
-					type: "scan-end",
-					branch: "main",
-					isBaseBranch: true,
-				}),
-			)
-
-			watcher.dispose()
-		})
-
-		it("should scan only diff files when on feature branch", async () => {
-			mockGetCurrentBranch.mockResolvedValue("feature/test")
-			mockGetBaseBranch.mockResolvedValue("main")
-			mockGetGitDiff.mockResolvedValue({
-				added: ["new-file.ts"],
-				modified: ["existing-file.ts"],
-				deleted: [],
-			})
-
-			// Mock git ls-files -s output for batched command
-			mockExecGetLines.mockImplementation(async function* () {
-				yield "100644 abc123 0 new-file.ts"
-				yield "100644 def456 0 existing-file.ts"
-			})
-
-			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-			watcher.onEvent(handler)
-
-			await watcher.scan()
-
-			// Verify single batched command was used
-			expect(mockExecGetLines).toHaveBeenCalledTimes(1)
-			expect(mockExecGetLines).toHaveBeenCalledWith({
-				cmd: 'git ls-files -s "new-file.ts" "existing-file.ts"',
-				cwd: config.cwd,
-				context: "getting file hashes for diff files",
-			})
-
-			// Should emit: scan-start, file-changed (x2), scan-end
-			expect(handler).toHaveBeenCalledTimes(4)
-
-			expect(handler).toHaveBeenCalledWith(
-				expect.objectContaining({
-					type: "file-changed",
-					filePath: "new-file.ts",
-					fileHash: "abc123",
-					branch: "feature/test",
-					isBaseBranch: false,
-				}),
-			)
-			expect(handler).toHaveBeenCalledWith(
-				expect.objectContaining({
-					type: "file-changed",
-					filePath: "existing-file.ts",
-					fileHash: "def456",
-					branch: "feature/test",
-					isBaseBranch: false,
-				}),
-			)
-
-			watcher.dispose()
-		})
-
-		it("should not scan when in detached HEAD state", async () => {
-			mockIsDetachedHead.mockResolvedValue(true)
-
-			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-			watcher.onEvent(handler)
-
-			await watcher.scan()
-
-			expect(handler).not.toHaveBeenCalled()
-			watcher.dispose()
-		})
-
-		it("should handle files with spaces in path", async () => {
-			mockGetCurrentBranch.mockResolvedValue("main")
-			mockGetBaseBranch.mockResolvedValue("main")
-
-			const mockLines = ["100644 abc123 0 path with spaces/file.ts"]
-
-			mockExecGetLines.mockImplementation(async function* () {
-				for (const line of mockLines) {
-					yield line
-				}
-			})
-
-			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-			watcher.onEvent(handler)
-
-			await watcher.scan()
-
-			expect(handler).toHaveBeenCalledWith(
-				expect.objectContaining({
-					type: "file-changed",
-					filePath: "path with spaces/file.ts",
-					fileHash: "abc123",
-					branch: "main",
-				}),
-			)
-
-			watcher.dispose()
-		})
-
-		it("should use defaultBranchOverride when provided", async () => {
-			const configWithOverride: GitWatcherConfig = {
-				cwd: "/test/repo",
-				defaultBranchOverride: "develop",
-			}
-
-			mockGetCurrentBranch.mockResolvedValue("develop")
-
-			const mockLines = ["100644 abc123 0 test.ts"]
-
-			mockExecGetLines.mockImplementation(async function* () {
-				for (const line of mockLines) {
-					yield line
-				}
-			})
-
-			const watcher = new GitWatcher(configWithOverride)
-			const handler = vi.fn()
-			watcher.onEvent(handler)
-
-			await watcher.scan()
-
-			// Should scan all files since we're on the default branch (develop)
-			expect(handler).toHaveBeenCalledWith(
-				expect.objectContaining({
-					type: "file-changed",
-					filePath: "test.ts",
-					fileHash: "abc123",
-					branch: "develop",
-					isBaseBranch: true,
-				}),
-			)
-
-			// getBaseBranch should not be called since we have an override
-			expect(mockGetBaseBranch).not.toHaveBeenCalled()
-
-			watcher.dispose()
-		})
-	})
-
 	describe("dispose", () => {
 		it("should clean up resources", () => {
 			const watcher = new GitWatcher(config)
@@ -459,10 +248,14 @@ describe("GitWatcher", () => {
 			watcher.dispose()
 
 			// Emit event after disposal - handler should not be called
-			;(watcher as any).emitter.emit("file", {
-				filePath: "test.ts",
-				fileHash: "abc123",
+			;(watcher as any).emitter.emit("event", {
+				type: "commit",
+				previousCommit: "abc",
+				newCommit: "def",
 				branch: "main",
+				isBaseBranch: true,
+				watcher,
+				files: (async function* () {})(),
 			})
 
 			expect(handler).not.toHaveBeenCalled()
@@ -485,19 +278,21 @@ describe("GitWatcher", () => {
 	})
 
 	describe("git state monitoring", () => {
-		it("should handle branch changes", async () => {
+		it("should handle branch changes and emit event with files", async () => {
 			mockGetCurrentBranch.mockResolvedValueOnce("main").mockResolvedValueOnce("feature/test")
 			mockGetCurrentCommitSha.mockResolvedValueOnce("abc123").mockResolvedValueOnce("abc123")
 			mockGetBaseBranch.mockResolvedValue("main")
+
+			// Mock git ls-files output for the new branch
+			mockExecGetLines.mockImplementation(async function* () {
+				yield "100644 def456 0 new-file.ts"
+			})
 
 			const watcher = new GitWatcher(config)
 			const handler = vi.fn()
 			watcher.onEvent(handler)
 
 			await watcher.start()
-
-			// Mock scan to avoid actual git operations
-			const scanSpy = vi.spyOn(watcher as any, "scan").mockResolvedValue(undefined)
 
 			// Simulate branch change by calling handleGitChange
 			await (watcher as any).handleGitChange()
@@ -513,15 +308,22 @@ describe("GitWatcher", () => {
 				}),
 			)
 
-			// Should trigger scan after branch change
-			expect(scanSpy).toHaveBeenCalled()
+			// Verify the files iterable is present
+			const event = handler.mock.calls[0][0]
+			expect(event.files).toBeDefined()
 
 			watcher.dispose()
 		})
 
-		it("should not emit branch-changed event when only commit changes", async () => {
+		it("should emit commit event when only commit changes", async () => {
 			mockGetCurrentBranch.mockResolvedValue("main")
 			mockGetCurrentCommitSha.mockResolvedValueOnce("abc123").mockResolvedValueOnce("def456")
+			mockGetBaseBranch.mockResolvedValue("main")
+
+			// Mock git ls-files output
+			mockExecGetLines.mockImplementation(async function* () {
+				yield "100644 ghi789 0 updated-file.ts"
+			})
 
 			const watcher = new GitWatcher(config)
 			const handler = vi.fn()
@@ -529,31 +331,23 @@ describe("GitWatcher", () => {
 
 			await watcher.start()
 
-			// Mock scan to avoid actual git operations
-			const scanSpy = vi.spyOn(watcher as any, "scan").mockResolvedValue(undefined)
-
 			// Simulate commit change (same branch)
 			await (watcher as any).handleGitChange()
 
-			// Should NOT emit branch-changed event
-			const branchChangedCalls = handler.mock.calls.filter((call) => call[0].type === "branch-changed")
-			expect(branchChangedCalls).toHaveLength(0)
+			// Should emit commit event
+			expect(handler).toHaveBeenCalledWith(
+				expect.objectContaining({
+					type: "commit",
+					previousCommit: "abc123",
+					newCommit: "def456",
+					branch: "main",
+					isBaseBranch: true,
+				}),
+			)
 
-			// Should still trigger scan
-			expect(scanSpy).toHaveBeenCalled()
-
-			watcher.dispose()
-		})
-
-		it("should handle commit changes", async () => {
-			mockGetCurrentBranch.mockResolvedValueOnce("main").mockResolvedValueOnce("main")
-			mockGetCurrentCommitSha.mockResolvedValueOnce("abc123").mockResolvedValueOnce("def456")
-
-			const watcher = new GitWatcher(config)
-			await watcher.start()
-
-			// Simulate commit change
-			await (watcher as any).handleGitChange()
+			// Verify the files iterable is present
+			const event = handler.mock.calls[0][0]
+			expect(event.files).toBeDefined()
 
 			watcher.dispose()
 		})
@@ -574,41 +368,124 @@ describe("GitWatcher", () => {
 		})
 	})
 
-	describe("error handling", () => {
-		it("should handle errors during scan", async () => {
+	describe("file iteration", () => {
+		it("should yield all files on base branch", async () => {
+			mockGetBaseBranch.mockResolvedValue("main")
+
+			const mockLines = [
+				"100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0 README.md",
+				"100644 a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0 0 src/index.ts",
+			]
+
 			mockExecGetLines.mockImplementation(async function* () {
-				throw new Error("Git command failed")
+				for (const line of mockLines) {
+					yield line
+				}
 			})
 
 			const watcher = new GitWatcher(config)
 
-			await expect(watcher.scan()).rejects.toThrow("Git command failed")
+			// Call the private getAllFiles method
+			const files: GitWatcherFile[] = []
+			for await (const file of (watcher as any).getAllFiles()) {
+				files.push(file)
+			}
+
+			expect(files).toHaveLength(2)
+			expect(files[0]).toEqual({
+				type: "file",
+				filePath: "README.md",
+				fileHash: "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+			})
+			expect(files[1]).toEqual({
+				type: "file",
+				filePath: "src/index.ts",
+				fileHash: "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0",
+			})
 
 			watcher.dispose()
 		})
 
-		it("should handle errors when getting file hash in diff mode", async () => {
-			mockGetCurrentBranch.mockResolvedValue("feature/test")
-			mockGetBaseBranch.mockResolvedValue("main")
+		it("should yield diff files on feature branch", async () => {
 			mockGetGitDiff.mockResolvedValue({
-				added: ["file1.ts"],
-				modified: [],
-				deleted: [],
+				added: ["new-file.ts"],
+				modified: ["existing-file.ts"],
+				deleted: ["old-file.ts"],
 			})
 
-			// Mock command failure
+			mockExecGetLines.mockImplementation(async function* () {
+				yield "100644 abc123 0 new-file.ts"
+				yield "100644 def456 0 existing-file.ts"
+			})
+
+			const watcher = new GitWatcher(config)
+
+			// Call the private getDiffFiles method
+			const files: GitWatcherFile[] = []
+			for await (const file of (watcher as any).getDiffFiles("feature/test", "main")) {
+				files.push(file)
+			}
+
+			expect(files).toHaveLength(3)
+			expect(files[0]).toEqual({
+				type: "file-deleted",
+				filePath: "old-file.ts",
+			})
+			expect(files[1]).toEqual({
+				type: "file",
+				filePath: "new-file.ts",
+				fileHash: "abc123",
+			})
+			expect(files[2]).toEqual({
+				type: "file",
+				filePath: "existing-file.ts",
+				fileHash: "def456",
+			})
+
+			watcher.dispose()
+		})
+
+		it("should handle files with spaces in path", async () => {
+			const mockLines = ["100644 abc123 0 path with spaces/file.ts"]
+
+			mockExecGetLines.mockImplementation(async function* () {
+				for (const line of mockLines) {
+					yield line
+				}
+			})
+
+			const watcher = new GitWatcher(config)
+
+			const files: GitWatcherFile[] = []
+			for await (const file of (watcher as any).getAllFiles()) {
+				files.push(file)
+			}
+
+			expect(files).toHaveLength(1)
+			expect(files[0]).toEqual({
+				type: "file",
+				filePath: "path with spaces/file.ts",
+				fileHash: "abc123",
+			})
+
+			watcher.dispose()
+		})
+	})
+
+	describe("error handling", () => {
+		it("should handle errors during file iteration", async () => {
 			mockExecGetLines.mockImplementation(async function* () {
 				throw new Error("Git command failed")
 			})
 
 			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-			watcher.onEvent(handler)
 
-			// Should throw since the batched command fails
-			await expect(watcher.scan()).rejects.toThrow("Git command failed")
-
-			expect(handler).not.toHaveBeenCalled()
+			// Should throw when iterating
+			await expect(async () => {
+				for await (const file of (watcher as any).getAllFiles()) {
+					// Should not reach here
+				}
+			}).rejects.toThrow("Git command failed")
 
 			watcher.dispose()
 		})

@@ -42,6 +42,13 @@ export interface GitWatcherConfig {
 }
 
 /**
+ * Represents a file in the git repository
+ */
+export type GitWatcherFile =
+	| { type: "file"; filePath: string; fileHash: string }
+	| { type: "file-deleted"; filePath: string }
+
+/**
  * Base event data shared by all GitWatcher events
  */
 interface GitWatcherBaseEvent {
@@ -59,47 +66,11 @@ interface GitWatcherBaseEvent {
 	 * Current instance which emitted the event
 	 */
 	watcher: GitWatcher
-}
-
-/**
- * Event emitted when a scan starts
- */
-export interface GitWatcherScanStartEvent extends GitWatcherBaseEvent {
-	type: "scan-start"
-}
-
-/**
- * Event emitted when a scan completes
- */
-export interface GitWatcherScanEndEvent extends GitWatcherBaseEvent {
-	type: "scan-end"
-}
-
-/**
- * Event emitted for a file change (added or modified)
- */
-export interface GitWatcherFileChangedEvent extends GitWatcherBaseEvent {
-	type: "file-changed"
-	/**
-	 * Relative path to the file from repository root
-	 */
-	filePath: string
 
 	/**
-	 * Git hash of the file (from git ls-files -s)
+	 * Async iterable that yields files affected by this event
 	 */
-	fileHash: string
-}
-
-/**
- * Event emitted for a file deletion
- */
-export interface GitWatcherFileDeletedEvent extends GitWatcherBaseEvent {
-	type: "file-deleted"
-	/**
-	 * Relative path to the deleted file from repository root
-	 */
-	filePath: string
+	files: AsyncIterable<GitWatcherFile>
 }
 
 /**
@@ -118,19 +89,29 @@ export interface GitWatcherBranchChangedEvent extends GitWatcherBaseEvent {
 }
 
 /**
+ * Event emitted when a commit is detected
+ */
+export interface GitWatcherCommitEvent extends GitWatcherBaseEvent {
+	type: "commit"
+	/**
+	 * The previous commit SHA
+	 */
+	previousCommit: string
+	/**
+	 * The new commit SHA
+	 */
+	newCommit: string
+}
+
+/**
  * Discriminated union of all GitWatcher event types
  */
-export type GitWatcherEvent =
-	| GitWatcherScanStartEvent
-	| GitWatcherScanEndEvent
-	| GitWatcherFileChangedEvent
-	| GitWatcherFileDeletedEvent
-	| GitWatcherBranchChangedEvent
+export type GitWatcherEvent = GitWatcherBranchChangedEvent | GitWatcherCommitEvent
 
 /**
  * @deprecated Use GitWatcherEvent instead. This type alias is provided for backward compatibility.
  */
-export type GitWatcherFileEvent = GitWatcherFileChangedEvent
+export type GitWatcherFileEvent = never
 
 /**
  * Git state snapshot for change detection
@@ -190,34 +171,24 @@ export class GitWatcher implements vscode.Disposable {
 	}
 
 	/**
-	 * Scan the repository and emit file events
+	 * Creates an async iterable that yields files from the repository
 	 *
 	 * Behavior:
-	 * - On default/main branch: Emits all tracked files
-	 * - On feature branch: Emits only files that differ from default branch
+	 * - On default/main branch: Yields all tracked files
+	 * - On feature branch: Yields only files that differ from default branch
 	 */
-	public async scan(): Promise<void> {
+	private async *getFiles(branch: string, isBaseBranch: boolean): AsyncIterable<GitWatcherFile> {
 		try {
-			// Check if in detached HEAD state
-			if (await isDetachedHead(this.config.cwd)) {
-				return
-			}
-
-			const currentBranch = await getCurrentBranch(this.config.cwd)
-			const defaultBranch = await this.getDefaultBranch()
-
-			// Determine if we're on the default branch
-			const isOnDefaultBranch = currentBranch.toLowerCase() === defaultBranch.toLowerCase()
-
-			if (isOnDefaultBranch) {
-				// On default branch: emit all tracked files
-				await this.scanAllFiles(currentBranch)
+			if (isBaseBranch) {
+				// On default branch: yield all tracked files
+				yield* this.getAllFiles()
 			} else {
-				// On feature branch: emit only diff files
-				await this.scanDiffFiles(currentBranch, defaultBranch)
+				// On feature branch: yield only diff files
+				const defaultBranch = await this.getDefaultBranch()
+				yield* this.getDiffFiles(branch, defaultBranch)
 			}
 		} catch (error) {
-			console.error("[GitWatcher] Error during scan:", error)
+			console.error("[GitWatcher] Error getting files:", error)
 			throw error
 		}
 	}
@@ -344,11 +315,11 @@ export class GitWatcher implements vscode.Disposable {
 					return
 				}
 
+				const defaultBranch = await this.getDefaultBranch()
+				const isBaseBranch = newState.branch.toLowerCase() === defaultBranch.toLowerCase()
+
 				// Emit branch-changed event if branch changed
 				if (branchChanged) {
-					const defaultBranch = await this.getDefaultBranch()
-					const isBaseBranch = newState.branch.toLowerCase() === defaultBranch.toLowerCase()
-
 					this.emitEvent({
 						type: "branch-changed",
 						previousBranch: this.currentState.branch,
@@ -356,11 +327,20 @@ export class GitWatcher implements vscode.Disposable {
 						branch: newState.branch,
 						isBaseBranch,
 						watcher: this,
+						files: this.getFiles(newState.branch, isBaseBranch),
+					})
+				} else if (commitChanged) {
+					// Emit commit event if only commit changed
+					this.emitEvent({
+						type: "commit",
+						previousCommit: this.currentState.commit,
+						newCommit: newState.commit,
+						branch: newState.branch,
+						isBaseBranch,
+						watcher: this,
+						files: this.getFiles(newState.branch, isBaseBranch),
 					})
 				}
-
-				// Trigger scan on state change
-				await this.scan()
 			}
 
 			this.currentState = newState
@@ -397,149 +377,73 @@ export class GitWatcher implements vscode.Disposable {
 	}
 
 	/**
-	 * @deprecated Use emitEvent instead
+	 * Get all tracked files in the repository
 	 */
-	private emitFile(event: GitWatcherFileChangedEvent): void {
-		this.emitEvent(event)
-	}
+	private async *getAllFiles(): AsyncIterable<GitWatcherFile> {
+		// Use git ls-files -s to get all tracked files with their hashes
+		for await (const line of execGetLines({
+			cmd: "git ls-files -s",
+			cwd: this.config.cwd,
+			context: "scanning git tracked files",
+		})) {
+			const trimmed = line.trim()
+			if (!trimmed) continue
 
-	/**
-	 * Scan all tracked files in the repository
-	 */
-	private async scanAllFiles(branch: string): Promise<void> {
-		try {
-			// Emit scan start event
-			this.emitEvent({
-				type: "scan-start",
-				branch,
-				isBaseBranch: true,
-				watcher: this,
-			})
+			// Parse git ls-files -s output
+			// Format: <mode> <hash> <stage> <path>
+			// Example: 100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0 README.md
+			const parts = trimmed.split(/\s+/)
+			if (parts.length < 4) continue
 
-			// Use git ls-files -s to get all tracked files with their hashes
-			for await (const line of execGetLines({
-				cmd: "git ls-files -s",
-				cwd: this.config.cwd,
-				context: "scanning git tracked files",
-			})) {
-				const trimmed = line.trim()
-				if (!trimmed) continue
+			const fileHash = parts[1]
+			const filePath = parts.slice(3).join(" ") // Handle paths with spaces
 
-				// Parse git ls-files -s output
-				// Format: <mode> <hash> <stage> <path>
-				// Example: 100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0 README.md
-				const parts = trimmed.split(/\s+/)
-				if (parts.length < 4) continue
-
-				const fileHash = parts[1]
-				const filePath = parts.slice(3).join(" ") // Handle paths with spaces
-
-				this.emitEvent({
-					type: "file-changed",
-					filePath,
-					fileHash,
-					branch,
-					isBaseBranch: true,
-					watcher: this,
-				})
-			}
-
-			// Emit scan end event
-			this.emitEvent({
-				type: "scan-end",
-				branch,
-				isBaseBranch: true,
-				watcher: this,
-			})
-		} catch (error) {
-			console.error("[GitWatcher] Error scanning all files:", error)
-			throw error
+			yield { type: "file", filePath, fileHash }
 		}
 	}
 
 	/**
-	 * Scan only files that differ from the default branch
+	 * Get only files that differ from the default branch
 	 */
-	private async scanDiffFiles(currentBranch: string, defaultBranch: string): Promise<void> {
-		try {
-			// Emit scan start event
-			this.emitEvent({
-				type: "scan-start",
-				branch: currentBranch,
-				isBaseBranch: false,
-				watcher: this,
-			})
+	private async *getDiffFiles(currentBranch: string, defaultBranch: string): AsyncIterable<GitWatcherFile> {
+		// Get the diff between current branch and default branch
+		const diff = await getGitDiff(currentBranch, defaultBranch, this.config.cwd)
 
-			// Get the diff between current branch and default branch
-			const diff = await getGitDiff(currentBranch, defaultBranch, this.config.cwd)
+		// Yield deleted files first
+		for (const deletedFile of diff.deleted) {
+			yield { type: "file-deleted", filePath: deletedFile }
+		}
 
-			// Emit deleted file events
-			for (const deletedFile of diff.deleted) {
-				this.emitEvent({
-					type: "file-deleted",
-					filePath: deletedFile,
-					branch: currentBranch,
-					isBaseBranch: false,
-					watcher: this,
-				})
-			}
+		// Combine added and modified files (we only care about files that exist)
+		const filesToScan = [...diff.added, ...diff.modified]
 
-			// Combine added and modified files (we only care about files that exist)
-			const filesToScan = [...diff.added, ...diff.modified]
+		if (filesToScan.length === 0) {
+			return
+		}
 
-			if (filesToScan.length === 0) {
-				// Emit scan end even if no files to scan
-				this.emitEvent({
-					type: "scan-end",
-					branch: currentBranch,
-					isBaseBranch: false,
-					watcher: this,
-				})
-				return
-			}
+		// Build single command with all files (quote each to handle spaces)
+		const quotedFiles = filesToScan.map((f) => `"${f}"`).join(" ")
+		const cmd = `git ls-files -s ${quotedFiles}`
 
-			// Build single command with all files (quote each to handle spaces)
-			const quotedFiles = filesToScan.map((f) => `"${f}"`).join(" ")
-			const cmd = `git ls-files -s ${quotedFiles}`
+		// Execute once and parse all results
+		for await (const line of execGetLines({
+			cmd,
+			cwd: this.config.cwd,
+			context: "getting file hashes for diff files",
+		})) {
+			const trimmed = line.trim()
+			if (!trimmed) continue
 
-			// Execute once and parse all results
-			for await (const line of execGetLines({
-				cmd,
-				cwd: this.config.cwd,
-				context: "getting file hashes for diff files",
-			})) {
-				const trimmed = line.trim()
-				if (!trimmed) continue
+			// Parse git ls-files -s output
+			// Format: <mode> <hash> <stage> <path>
+			// Example: 100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0 README.md
+			const parts = trimmed.split(/\s+/)
+			if (parts.length < 4) continue
 
-				// Parse git ls-files -s output
-				// Format: <mode> <hash> <stage> <path>
-				// Example: 100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0 README.md
-				const parts = trimmed.split(/\s+/)
-				if (parts.length < 4) continue
+			const fileHash = parts[1]
+			const filePath = parts.slice(3).join(" ") // Handle paths with spaces
 
-				const fileHash = parts[1]
-				const filePath = parts.slice(3).join(" ") // Handle paths with spaces
-
-				this.emitEvent({
-					type: "file-changed",
-					filePath,
-					fileHash,
-					branch: currentBranch,
-					isBaseBranch: false,
-					watcher: this,
-				})
-			}
-
-			// Emit scan end event
-			this.emitEvent({
-				type: "scan-end",
-				branch: currentBranch,
-				isBaseBranch: false,
-				watcher: this,
-			})
-		} catch (error) {
-			console.error("[GitWatcher] Error scanning diff files:", error)
-			throw error
+			yield { type: "file", filePath, fileHash }
 		}
 	}
 }

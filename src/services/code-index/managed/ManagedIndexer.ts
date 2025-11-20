@@ -268,12 +268,9 @@ export class ManagedIndexer implements vscode.Disposable {
 
 		this.workspaceFolderState = states.filter((s) => s !== null)
 
-		// Kick off scans and start watchers
+		// Start watchers
 		await Promise.all(
 			this.workspaceFolderState.map(async (state) => {
-				// Perform an initial scan
-				await state.watcher?.scan()
-				// Then start the watcher
 				await state.watcher?.start()
 			}),
 		)
@@ -376,9 +373,7 @@ export class ManagedIndexer implements vscode.Disposable {
 	}
 
 	async onEvent(event: GitWatcherEvent): Promise<void> {
-		if (event.type !== "file-changed") {
-			console.log("[ManagedIndexer] event", event, this)
-		}
+		console.log("[ManagedIndexer] event", event.type, event.branch)
 
 		if (!this.isActive) {
 			return
@@ -409,53 +404,64 @@ export class ManagedIndexer implements vscode.Disposable {
 					// Error already logged and stored in getManifest
 					console.warn(`[ManagedIndexer] Continuing despite manifest fetch error`)
 				}
+
+				// Process files from the async iterable
+				await this.processFiles(state, event)
 				break
 			}
 
-			case "scan-start":
-				// Update isIndexing state and clear any previous errors
-				state.isIndexing = true
-				state.error = undefined
-				console.info(`[ManagedIndexer] Scan started on branch ${event.branch}`)
-				break
+			case "commit": {
+				console.info(`[ManagedIndexer] Commit detected from ${event.previousCommit} to ${event.newCommit}`)
 
-			case "scan-end":
-				// Update isIndexing state
+				// Process files from the async iterable
+				await this.processFiles(state, event)
+				break
+			}
+		}
+	}
+
+	/**
+	 * Process files from an event's async iterable
+	 */
+	private async processFiles(state: ManagedIndexerWorkspaceFolderState, event: GitWatcherEvent): Promise<void> {
+		// Set indexing state
+		state.isIndexing = true
+		state.error = undefined
+
+		try {
+			// Ensure we have the manifest (wait if it's being fetched)
+			let manifest: ServerManifest
+			try {
+				manifest = await this.getManifest(state, event.branch)
+			} catch (error) {
+				console.warn(`[ManagedIndexer] Cannot process files without manifest, skipping`)
 				state.isIndexing = false
-				console.info(`[ManagedIndexer] Scan completed on branch ${event.branch}`)
-				break
+				return
+			}
 
-			case "file-deleted":
-				console.info(`[ManagedIndexer] File deleted: ${event.filePath} on branch ${event.branch}`)
-				// TODO: Implement file deletion handling if needed
-				break
+			// Process each file from the async iterable
+			for await (const file of event.files) {
+				if (file.type === "file-deleted") {
+					console.info(`[ManagedIndexer] File deleted: ${file.filePath} on branch ${event.branch}`)
+					// TODO: Implement file deletion handling if needed
+					continue
+				}
 
-			case "file-changed": {
-				const { branch, filePath, fileHash, isBaseBranch, watcher } = event
+				const { filePath, fileHash } = file
 
 				// Check if file extension is supported
 				const ext = path.extname(filePath).toLowerCase()
 				if (!scannerExtensions.includes(ext)) {
-					console.info(`[ManagedIndexer] Skipping file with unsupported extension: ${filePath}`)
-					return
-				}
-
-				// Ensure we have the manifest (wait if it's being fetched)
-				let manifest: ServerManifest
-				try {
-					manifest = await this.getManifest(state, branch)
-				} catch (error) {
-					console.warn(`[ManagedIndexer] Cannot process file without manifest, skipping`)
-					return
+					continue
 				}
 
 				// Already indexed - check if fileHash exists in the map and matches the filePath
 				if (manifest.files[fileHash] === filePath) {
-					return
+					continue
 				}
 
 				// Concurrently process the file
-				return await this.fileUpsertLimit(async () => {
+				await this.fileUpsertLimit(async () => {
 					try {
 						// Ensure we have the necessary configuration
 						if (!this.config?.kilocodeToken || !this.config?.kilocodeOrganizationId || !state.projectId) {
@@ -468,24 +474,24 @@ export class ManagedIndexer implements vscode.Disposable {
 
 						const absoluteFilePath = path.isAbsolute(filePath)
 							? filePath
-							: path.join(watcher.config.cwd, filePath)
+							: path.join(event.watcher.config.cwd, filePath)
 						const fileBuffer = await fs.readFile(absoluteFilePath)
-						const relativeFilePath = path.relative(watcher.config.cwd, absoluteFilePath)
+						const relativeFilePath = path.relative(event.watcher.config.cwd, absoluteFilePath)
 
 						// Call the upsertFile API
 						await upsertFile({
 							fileBuffer,
 							fileHash,
 							filePath: relativeFilePath,
-							gitBranch: branch,
-							isBaseBranch,
+							gitBranch: event.branch,
+							isBaseBranch: event.isBaseBranch,
 							organizationId: this.config.kilocodeOrganizationId,
 							projectId,
 							kilocodeToken: this.config.kilocodeToken,
 						})
 
 						console.info(
-							`[ManagedIndexer] Successfully upserted file: ${relativeFilePath} (branch: ${branch})`,
+							`[ManagedIndexer] Successfully upserted file: ${relativeFilePath} (branch: ${event.branch})`,
 						)
 
 						// Clear any previous file-upsert errors on success
@@ -503,7 +509,7 @@ export class ManagedIndexer implements vscode.Disposable {
 							timestamp: new Date().toISOString(),
 							context: {
 								filePath,
-								branch,
+								branch: event.branch,
 								operation: "file-upsert",
 							},
 							details: error instanceof Error ? error.stack : undefined,
@@ -511,6 +517,9 @@ export class ManagedIndexer implements vscode.Disposable {
 					}
 				})
 			}
+		} finally {
+			// Always clear indexing state when done
+			state.isIndexing = false
 		}
 	}
 
