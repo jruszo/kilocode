@@ -341,7 +341,7 @@ export class ManagedIndexer implements vscode.Disposable {
 
 				state.manifest = manifest
 				console.info(
-					`[ManagedIndexer] Successfully fetched manifest for branch ${branch} (${manifest.files.length} files)`,
+					`[ManagedIndexer] Successfully fetched manifest for branch ${branch} (${Object.keys(manifest.files).length} files)`,
 				)
 
 				// Clear any previous manifest errors
@@ -376,6 +376,10 @@ export class ManagedIndexer implements vscode.Disposable {
 	}
 
 	async onEvent(event: GitWatcherEvent): Promise<void> {
+		if (event.type !== "file-changed") {
+			console.log("[ManagedIndexer] event", event, this)
+		}
+
 		if (!this.isActive) {
 			return
 		}
@@ -445,8 +449,8 @@ export class ManagedIndexer implements vscode.Disposable {
 					return
 				}
 
-				// Already indexed
-				if (manifest.files.some((f) => f.filePath === filePath && f.fileHash === fileHash)) {
+				// Already indexed - check if fileHash exists in the map and matches the filePath
+				if (manifest.files[fileHash] === filePath) {
 					return
 				}
 
@@ -528,7 +532,7 @@ export class ManagedIndexer implements vscode.Disposable {
 			projectId: state.projectId,
 			isIndexing: state.isIndexing,
 			hasManifest: !!state.manifest,
-			manifestFileCount: state.manifest?.files.length ?? 0,
+			manifestFileCount: state.manifest ? Object.keys(state.manifest.files).length : 0,
 			hasWatcher: !!state.watcher,
 			error: state.error
 				? {

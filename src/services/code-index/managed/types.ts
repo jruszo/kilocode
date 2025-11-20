@@ -133,8 +133,10 @@ export interface ServerManifest {
 	projectId: string
 	/** Git branch */
 	gitBranch: string
-	/** List of indexed files */
-	files: ManifestFileEntry[]
+	/** Map of indexed files by fileHash to filePath */
+	files: {
+		[fileHash: string]: string
+	}
 	/** Total number of files in manifest */
 	totalFiles: number
 	/** Total number of chunks across all files */

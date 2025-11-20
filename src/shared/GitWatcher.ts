@@ -190,17 +190,6 @@ export class GitWatcher implements vscode.Disposable {
 	}
 
 	/**
-	 * @deprecated Use onEvent instead. This method is provided for backward compatibility.
-	 */
-	public onFile(handler: (data: GitWatcherFileChangedEvent) => void): void {
-		this.emitter.on("event", (event: GitWatcherEvent) => {
-			if (event.type === "file-changed") {
-				handler(event)
-			}
-		})
-	}
-
-	/**
 	 * Scan the repository and emit file events
 	 *
 	 * Behavior:

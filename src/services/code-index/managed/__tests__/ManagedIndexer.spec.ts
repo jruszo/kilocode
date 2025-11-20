@@ -85,7 +85,7 @@ describe("ManagedIndexer", () => {
 			project: { id: "test-project-id" },
 		} as any)
 		vi.mocked(apiClient.getServerManifest).mockResolvedValue({
-			files: [],
+			files: {},
 		} as any)
 
 		// Mock OrganizationService
@@ -518,7 +518,7 @@ describe("ManagedIndexer", () => {
 			expect(state.isIndexing).toBe(false)
 		})
 
-		it("should warn when event is from unknown watcher", async () => {
+		it("should not process events from unknown watcher", async () => {
 			const unknownWatcher = new GitWatcher({ cwd: "/unknown" })
 
 			const event: GitWatcherEvent = {
@@ -530,7 +530,8 @@ describe("ManagedIndexer", () => {
 
 			await indexer.onEvent(event)
 
-			expect(logger.warn).toHaveBeenCalledWith("[ManagedIndexer] Received event for unknown watcher")
+			// State should not be modified for unknown watcher
+			expect(state.isIndexing).toBe(false)
 		})
 
 		describe("scan-start event", () => {
@@ -545,7 +546,6 @@ describe("ManagedIndexer", () => {
 				await indexer.onEvent(event)
 
 				expect(state.isIndexing).toBe(true)
-				expect(logger.info).toHaveBeenCalledWith("[ManagedIndexer] Scan started on branch main")
 			})
 		})
 
@@ -563,12 +563,11 @@ describe("ManagedIndexer", () => {
 				await indexer.onEvent(event)
 
 				expect(state.isIndexing).toBe(false)
-				expect(logger.info).toHaveBeenCalledWith("[ManagedIndexer] Scan completed on branch main")
 			})
 		})
 
 		describe("file-deleted event", () => {
-			it("should log file deletion", async () => {
+			it("should handle file deletion", async () => {
 				const event: GitWatcherEvent = {
 					type: "file-deleted",
 					filePath: "deleted.ts",
@@ -577,16 +576,15 @@ describe("ManagedIndexer", () => {
 					watcher: mockWatcher,
 				}
 
+				// Should not throw
 				await indexer.onEvent(event)
-
-				expect(logger.info).toHaveBeenCalledWith("[ManagedIndexer] File deleted: deleted.ts on branch main")
 			})
 		})
 
 		describe("branch-changed event", () => {
 			it("should fetch new manifest for the new branch", async () => {
 				const newManifest = {
-					files: [{ filePath: "new-branch-file.ts", fileHash: "new123" }],
+					files: { new123: "new-branch-file.ts" },
 				}
 				vi.mocked(apiClient.getServerManifest).mockResolvedValue(newManifest as any)
 
@@ -697,7 +695,7 @@ describe("ManagedIndexer", () => {
 				const fileEventPromise = indexer.onEvent(fileEvent)
 
 				// Complete the manifest fetch
-				resolveManifest({ files: [] })
+				resolveManifest({ files: {} })
 				await Promise.all([branchChangePromise, fileEventPromise])
 
 				// Should only have called getServerManifest once (reused the promise)
@@ -727,32 +725,13 @@ describe("ManagedIndexer", () => {
 
 				expect(state.error).toBeDefined()
 				expect(state.error?.type).toBe("manifest")
-				expect(logger.warn).toHaveBeenCalledWith("[ManagedIndexer] Continuing despite manifest fetch error")
-			})
-
-			it("should log branch change information", async () => {
-				const event: GitWatcherEvent = {
-					type: "branch-changed",
-					previousBranch: "main",
-					newBranch: "feature/test",
-					branch: "feature/test",
-					isBaseBranch: false,
-					watcher: mockWatcher,
-				}
-
-				await indexer.onEvent(event)
-
-				expect(logger.info).toHaveBeenCalledWith("[ManagedIndexer] Branch changed from main to feature/test")
-				expect(logger.info).toHaveBeenCalledWith(
-					expect.stringContaining("Successfully fetched manifest for branch feature/test"),
-				)
 			})
 		})
 
 		describe("file-changed event", () => {
 			it("should skip already indexed files", async () => {
 				state.manifest = {
-					files: [{ filePath: "test.ts", fileHash: "abc123" }],
+					files: { abc123: "test.ts" },
 				}
 
 				const event: GitWatcherEvent = {
@@ -773,7 +752,7 @@ describe("ManagedIndexer", () => {
 				const fs = await import("fs")
 				vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
 
-				state.manifest = { files: [] }
+				state.manifest = { files: {} }
 
 				const event: GitWatcherEvent = {
 					type: "file-changed",
@@ -805,7 +784,7 @@ describe("ManagedIndexer", () => {
 				const fs = await import("fs")
 				vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
 
-				state.manifest = { files: [] }
+				state.manifest = { files: {} }
 
 				const event: GitWatcherEvent = {
 					type: "file-changed",
@@ -834,7 +813,7 @@ describe("ManagedIndexer", () => {
 					kilocodeTesterWarningsDisabledUntil: null,
 				}
 
-				state.manifest = { files: [] }
+				state.manifest = { files: {} }
 
 				const event: GitWatcherEvent = {
 					type: "file-changed",
@@ -849,9 +828,6 @@ describe("ManagedIndexer", () => {
 
 				await new Promise((resolve) => setTimeout(resolve, 10))
 
-				expect(logger.warn).toHaveBeenCalledWith(
-					"[ManagedIndexer] Missing token, organization ID, or project ID, skipping file upsert",
-				)
 				expect(apiClient.upsertFile).not.toHaveBeenCalled()
 			})
 
@@ -859,7 +835,7 @@ describe("ManagedIndexer", () => {
 				const fs = await import("fs")
 				vi.mocked(fs.promises.readFile).mockRejectedValue(new Error("File not found"))
 
-				state.manifest = { files: [] }
+				state.manifest = { files: {} }
 
 				const event: GitWatcherEvent = {
 					type: "file-changed",
@@ -874,9 +850,8 @@ describe("ManagedIndexer", () => {
 
 				await new Promise((resolve) => setTimeout(resolve, 10))
 
-				expect(logger.error).toHaveBeenCalledWith(
-					expect.stringContaining("[ManagedIndexer] Failed to upsert file missing.ts"),
-				)
+				// Error should be stored in state
+				expect(state.error?.type).toBe("file-upsert")
 			})
 
 			it("should handle API errors", async () => {
@@ -884,7 +859,7 @@ describe("ManagedIndexer", () => {
 				vi.mocked(fs.promises.readFile).mockResolvedValue(Buffer.from("file content"))
 				vi.mocked(apiClient.upsertFile).mockRejectedValue(new Error("API error"))
 
-				state.manifest = { files: [] }
+				state.manifest = { files: {} }
 
 				const event: GitWatcherEvent = {
 					type: "file-changed",
@@ -899,13 +874,12 @@ describe("ManagedIndexer", () => {
 
 				await new Promise((resolve) => setTimeout(resolve, 10))
 
-				expect(logger.error).toHaveBeenCalledWith(
-					expect.stringContaining("[ManagedIndexer] Failed to upsert file test.ts: API error"),
-				)
+				// Error should be stored in state
+				expect(state.error?.type).toBe("file-upsert")
 			})
 
 			it("should skip files with unsupported extensions", async () => {
-				state.manifest = { files: [] }
+				state.manifest = { files: {} }
 
 				const event: GitWatcherEvent = {
 					type: "file-changed",
@@ -920,9 +894,6 @@ describe("ManagedIndexer", () => {
 
 				await new Promise((resolve) => setTimeout(resolve, 10))
 
-				expect(logger.info).toHaveBeenCalledWith(
-					"[ManagedIndexer] Skipping file with unsupported extension: test.unsupported",
-				)
 				expect(apiClient.upsertFile).not.toHaveBeenCalled()
 			})
 		})

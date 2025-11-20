@@ -221,63 +221,6 @@ describe("GitWatcher", () => {
 		})
 	})
 
-	describe("onFile (deprecated)", () => {
-		it("should still work for backward compatibility", () => {
-			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-
-			watcher.onFile(handler)
-
-			// Emit a file-changed event
-			const testEvent: GitWatcherFileChangedEvent = {
-				type: "file-changed",
-				filePath: "test.ts",
-				fileHash: "abc123",
-				branch: "main",
-				isBaseBranch: true,
-				watcher,
-			}
-
-			;(watcher as any).emitter.emit("event", testEvent)
-
-			expect(handler).toHaveBeenCalledWith(testEvent)
-			watcher.dispose()
-		})
-
-		it("should only receive file-changed events", () => {
-			const watcher = new GitWatcher(config)
-			const handler = vi.fn()
-
-			watcher.onFile(handler)
-
-			// Emit various event types
-			;(watcher as any).emitter.emit("event", {
-				type: "scan-start",
-				branch: "main",
-				isBaseBranch: true,
-				watcher,
-			})
-			;(watcher as any).emitter.emit("event", {
-				type: "file-changed",
-				filePath: "test.ts",
-				fileHash: "abc123",
-				branch: "main",
-				isBaseBranch: true,
-				watcher,
-			})
-			;(watcher as any).emitter.emit("event", {
-				type: "scan-end",
-				branch: "main",
-				isBaseBranch: true,
-				watcher,
-			})
-
-			// Should only be called once for file-changed event
-			expect(handler).toHaveBeenCalledTimes(1)
-			watcher.dispose()
-		})
-	})
-
 	describe("start", () => {
 		it("should initialize git state monitoring", async () => {
 			const watcher = new GitWatcher(config)
@@ -511,7 +454,7 @@ describe("GitWatcher", () => {
 		it("should clean up resources", () => {
 			const watcher = new GitWatcher(config)
 			const handler = vi.fn()
-			watcher.onFile(handler)
+			watcher.onEvent(handler)
 
 			watcher.dispose()
 
@@ -660,7 +603,7 @@ describe("GitWatcher", () => {
 
 			const watcher = new GitWatcher(config)
 			const handler = vi.fn()
-			watcher.onFile(handler)
+			watcher.onEvent(handler)
 
 			// Should throw since the batched command fails
 			await expect(watcher.scan()).rejects.toThrow("Git command failed")
